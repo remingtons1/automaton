@@ -536,6 +536,95 @@ Your goal is customer acquisition and outreach, NOT building.`;
           }
         },
       },
+      // Hustler distribution tools — web fetch, search, email
+      {
+        name: "web_fetch",
+        description: "HTTP fetch with full control. GET/POST/PUT/DELETE. Returns status and body.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "URL to fetch" },
+            method: { type: "string", description: "HTTP method (default: GET)" },
+            headers: { type: "object", description: "Request headers" },
+            body: { type: "string", description: "Request body" },
+          },
+          required: ["url"],
+        },
+        execute: async (args) => {
+          try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 30_000);
+            const resp = await fetch(args.url as string, {
+              method: (args.method as string) || "GET",
+              headers: (args.headers as Record<string, string>) || {},
+              body: (args.body as string) || undefined,
+              signal: controller.signal,
+            });
+            clearTimeout(timeout);
+            const contentType = resp.headers.get("content-type") || "";
+            let responseBody = contentType.includes("json")
+              ? JSON.stringify(await resp.json())
+              : await resp.text();
+            if (responseBody.length > 10_000) responseBody = responseBody.slice(0, 10_000) + "\n[TRUNCATED]";
+            return JSON.stringify({ status: resp.status, body: responseBody });
+          } catch (error) {
+            return `web_fetch error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        },
+      },
+      {
+        name: "search_web",
+        description: "Search the web. Returns titles, links, and snippets. Requires SERP_API_KEY env var.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search query" },
+          },
+          required: ["query"],
+        },
+        execute: async (args) => {
+          const apiKey = process.env.SERP_API_KEY;
+          if (!apiKey) return "Error: SERP_API_KEY not set";
+          try {
+            const params = new URLSearchParams({ q: args.query as string, api_key: apiKey, num: "10", engine: "google" });
+            const resp = await fetch(`https://serpapi.com/search?${params}`);
+            if (!resp.ok) return `SerpAPI error: ${resp.status}`;
+            const data = await resp.json();
+            return JSON.stringify((data.organic_results || []).slice(0, 10).map((r: any) => ({ title: r.title, link: r.link, snippet: r.snippet })));
+          } catch (error) {
+            return `search_web error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        },
+      },
+      {
+        name: "send_email",
+        description: "Send an email via Resend API. Requires RESEND_API_KEY env var.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email" },
+            subject: { type: "string", description: "Subject line" },
+            body: { type: "string", description: "Email body (HTML)" },
+          },
+          required: ["to", "subject", "body"],
+        },
+        execute: async (args) => {
+          const apiKey = process.env.RESEND_API_KEY;
+          if (!apiKey) return "Error: RESEND_API_KEY not set";
+          try {
+            const resp = await fetch("https://api.resend.com/emails", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+              body: JSON.stringify({ from: "onboarding@resend.dev", to: [args.to], subject: args.subject, html: args.body }),
+            });
+            if (!resp.ok) return `Resend error: ${resp.status} ${await resp.text()}`;
+            const result = await resp.json();
+            return `Email sent to ${args.to}: ${result.id}`;
+          } catch (error) {
+            return `send_email error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        },
+      },
     ];
   }
 }

@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -675,4 +675,20 @@ export const MIGRATION_V10 = `
 // === V11: Per-goal budget enforcement ===
 export const MIGRATION_V11_ALTER_GOALS_BUDGET = `
   ALTER TABLE goals ADD COLUMN budget_cents INTEGER DEFAULT 100;
+`;
+
+// === V12: Pocket Money Ledger (Street Hustler Mode) ===
+export const MIGRATION_V12 = `
+  CREATE TABLE IF NOT EXISTS pocket_money (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    type TEXT NOT NULL CHECK(type IN ('debit','credit')),
+    amount_cents INTEGER NOT NULL,
+    balance_after_cents INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pocket_money_timestamp ON pocket_money(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pocket_money_type ON pocket_money(type);
 `;

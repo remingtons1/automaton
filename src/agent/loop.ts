@@ -66,6 +66,11 @@ import { EventStream } from "../memory/event-stream.js";
 import { KnowledgeStore } from "../memory/knowledge-store.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import type { PocketMoneyLedger } from "../treasury/pocket-money.js";
+import { calculateInferenceCost } from "../treasury/cost-tracker.js";
+import { createDeployTools } from "../hustler/deploy.js";
+import { createPaymentTools } from "../hustler/payments.js";
+import { createDistributionTools } from "../hustler/distribution.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -85,6 +90,7 @@ export interface AgentLoopOptions {
   onStateChange?: (state: AgentState) => void;
   onTurnComplete?: (turn: AgentTurn) => void;
   ollamaBaseUrl?: string;
+  pocketMoney?: PocketMoneyLedger;
 }
 
 /**
@@ -94,12 +100,67 @@ export interface AgentLoopOptions {
 export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<void> {
-  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
+  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl, pocketMoney } =
     options;
+  const isStandalone = config.mode === "standalone";
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+
+  // In standalone mode, filter out Conway-only tools
+  const CONWAY_ONLY_TOOLS = new Set([
+    "check_credits", "check_usdc_balance", "topup_credits",
+    "create_sandbox", "delete_sandbox", "list_sandboxes",
+    "transfer_credits", "spawn_child", "fund_child",
+  ]);
+  let filteredBuiltins = isStandalone
+    ? builtinTools.filter((t) => !CONWAY_ONLY_TOOLS.has(t.name))
+    : builtinTools;
+
+  // Add hustler tools in standalone mode
+  const hustlerTools: AutomatonTool[] = [];
+  if (config.digitaloceanApiKey) {
+    hustlerTools.push(...createDeployTools(config.digitaloceanApiKey));
+  }
+  if (config.stripeSecretKey) {
+    hustlerTools.push(...createPaymentTools(config.stripeSecretKey, pocketMoney));
+  }
+  hustlerTools.push(
+    ...createDistributionTools({
+      serpApiKey: config.serpApiKey,
+      resendApiKey: config.resendApiKey,
+    }),
+  );
+
+  // Add check_balance tool for pocket money
+  if (pocketMoney) {
+    hustlerTools.push({
+      name: "check_balance",
+      description: "Check pocket money balance, survival tier, and recent transactions.",
+      category: "financial" as any,
+      riskLevel: "safe" as any,
+      parameters: { type: "object", properties: {} },
+      execute: async () => {
+        const balance = pocketMoney.getBalance();
+        const tier = pocketMoney.getSurvivalTier();
+        const recent = pocketMoney.getTransactions(5);
+        return JSON.stringify({
+          balanceCents: balance,
+          balanceUsd: (balance / 100).toFixed(2),
+          tier,
+          recentTransactions: recent.map((t) => ({
+            type: t.type,
+            amount: `${t.type === "debit" ? "-" : "+"}${t.amountCents}¢`,
+            balance: `${t.balanceAfterCents}¢`,
+            source: t.source,
+            description: t.description,
+          })),
+        });
+      },
+    });
+  }
+
+  const tools = [...filteredBuiltins, ...hustlerTools, ...installedTools];
   const toolContext: ToolContext = {
     identity,
     config,
@@ -320,7 +381,16 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db);
+  let financial: FinancialState;
+  if (isStandalone && pocketMoney) {
+    financial = {
+      creditsCents: pocketMoney.getBalance(),
+      usdcBalance: 0,
+      lastChecked: new Date().toISOString(),
+    };
+  } else {
+    financial = await getFinancialState(conway, identity.address, db);
+  }
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -388,7 +458,15 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db);
+      if (isStandalone && pocketMoney) {
+        financial = {
+          creditsCents: pocketMoney.getBalance(),
+          usdcBalance: 0,
+          lastChecked: new Date().toISOString(),
+        };
+      } else {
+        financial = await getFinancialState(conway, identity.address, db);
+      }
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
@@ -403,7 +481,8 @@ export async function runAgentLoop(
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        // Skip in standalone mode — no Conway credits to top up.
+        if (!isStandalone && (tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||
@@ -642,6 +721,29 @@ export async function runAgentLoop(
         }
       });
       onTurnComplete?.(turn);
+
+      // Pocket money deduction (standalone mode)
+      if (pocketMoney) {
+        const model = config.inferenceModel || "gpt-4o";
+        const costCents = calculateInferenceCost(
+          model,
+          response.usage.promptTokens,
+          response.usage.completionTokens,
+        );
+        if (costCents > 0) {
+          const alive = pocketMoney.deduct(
+            costCents,
+            `${model}: ${response.usage.promptTokens}in/${response.usage.completionTokens}out`,
+          );
+          if (!alive) {
+            log(config, "[DEAD] Pocket money exhausted. Agent is dead.");
+            db.setAgentState("dead");
+            onStateChange?.("dead");
+            running = false;
+            break;
+          }
+        }
+      }
 
       // Phase 2.2: Post-turn memory ingestion (non-blocking)
       try {

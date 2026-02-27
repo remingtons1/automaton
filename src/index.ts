@@ -11,7 +11,7 @@ import { getWallet, getAutomatonDir } from "./identity/wallet.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
 import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
-import { createConwayClient } from "./conway/client.js";
+import { createConwayClient, createStandaloneClient } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
@@ -31,6 +31,8 @@ import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from
 import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel } from "./observability/logger.js";
 import { bootstrapTopup } from "./conway/topup.js";
+import { createPocketMoneyLedger } from "./treasury/pocket-money.js";
+import type { PocketMoneyLedger } from "./treasury/pocket-money.js";
 import { randomUUID } from "crypto";
 import { keccak256, toHex } from "viem";
 
@@ -183,8 +185,13 @@ async function run(): Promise<void> {
   // Load wallet
   const { account } = await getWallet();
   const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
+
+  // Determine mode: standalone (no Conway API key) vs conway
+  const isStandalone = !apiKey;
+  const mode = config.mode ?? (isStandalone ? "standalone" : "conway");
+
+  if (!apiKey && mode === "conway") {
+    logger.error("No API key found. Run: automaton --provision (or remove conwayApiKey to run standalone)");
     process.exit(1);
   }
 
@@ -206,7 +213,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: apiKey || "",
     createdAt,
   };
 
@@ -221,39 +228,50 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
-    sandboxId: config.sandboxId,
-  });
+  // Create Conway client (or standalone client)
+  let conway;
+  let pocketMoney: PocketMoneyLedger | undefined;
 
-  // Register automaton identity (one-time, immutable)
-  const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
-    try {
-      const genesisPromptHash = config.genesisPrompt
-        ? keccak256(toHex(config.genesisPrompt))
-        : undefined;
-      await conway.registerAutomaton({
-        automatonId,
-        automatonAddress: account.address,
-        creatorAddress: config.creatorAddress,
-        name: config.name,
-        bio: config.creatorMessage || "",
-        genesisPromptHash,
-        account,
-      });
-      db.setIdentity("conwayRegistrationStatus", "registered");
-      logger.info(`[${new Date().toISOString()}] Automaton identity registered.`);
-    } catch (err: any) {
-      const status = err?.status;
-      if (status === 409) {
-        db.setIdentity("conwayRegistrationStatus", "conflict");
-        logger.warn(`[${new Date().toISOString()}] Automaton identity conflict: ${err.message}`);
-      } else {
-        db.setIdentity("conwayRegistrationStatus", "failed");
-        logger.warn(`[${new Date().toISOString()}] Automaton identity registration failed: ${err.message}`);
+  if (mode === "standalone") {
+    conway = createStandaloneClient();
+    pocketMoney = createPocketMoneyLedger(db.raw, config.pocketMoneyCents ?? 1000);
+    logger.info(
+      `[${new Date().toISOString()}] Standalone mode. Pocket money: $${(pocketMoney.getBalance() / 100).toFixed(2)}`,
+    );
+  } else {
+    conway = createConwayClient({
+      apiUrl: config.conwayApiUrl,
+      apiKey: apiKey!,
+      sandboxId: config.sandboxId,
+    });
+
+    // Register automaton identity (one-time, immutable)
+    const registrationState = db.getIdentity("conwayRegistrationStatus");
+    if (registrationState !== "registered") {
+      try {
+        const genesisPromptHash = config.genesisPrompt
+          ? keccak256(toHex(config.genesisPrompt))
+          : undefined;
+        await conway.registerAutomaton({
+          automatonId,
+          automatonAddress: account.address,
+          creatorAddress: config.creatorAddress,
+          name: config.name,
+          bio: config.creatorMessage || "",
+          genesisPromptHash,
+          account,
+        });
+        db.setIdentity("conwayRegistrationStatus", "registered");
+        logger.info(`[${new Date().toISOString()}] Automaton identity registered.`);
+      } catch (err: any) {
+        const status = err?.status;
+        if (status === 409) {
+          db.setIdentity("conwayRegistrationStatus", "conflict");
+          logger.warn(`[${new Date().toISOString()}] Automaton identity conflict: ${err.message}`);
+        } else {
+          db.setIdentity("conwayRegistrationStatus", "failed");
+          logger.warn(`[${new Date().toISOString()}] Automaton identity registration failed: ${err.message}`);
+        }
       }
     }
   }
@@ -267,7 +285,7 @@ async function run(): Promise<void> {
   modelRegistry.initialize();
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: apiKey || "",
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
@@ -318,34 +336,36 @@ async function run(): Promise<void> {
   }
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
-  // The agent decides larger topups itself via the topup_credits tool.
-  try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
-    });
+  // Skip in standalone mode — pocket money is the funding source.
+  if (mode !== "standalone") {
     try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
+      let bootstrapTimer: ReturnType<typeof setTimeout>;
+      const bootstrapTimeout = new Promise<null>((_, reject) => {
+        bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+      });
+      try {
+        await Promise.race([
+          (async () => {
+            const creditsCents = await conway.getCreditsBalance().catch(() => 0);
+            const topupResult = await bootstrapTopup({
+              apiUrl: config.conwayApiUrl,
+              account,
+              creditsCents,
+            });
+            if (topupResult?.success) {
+              logger.info(
+                `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
+              );
+            }
+          })(),
+          bootstrapTimeout,
+        ]);
+      } finally {
+        clearTimeout(bootstrapTimer!);
+      }
+    } catch (err: any) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
   }
 
   // Start heartbeat daemon (Phase 1.1: DurableScheduler)
@@ -404,6 +424,7 @@ async function run(): Promise<void> {
         policyEngine,
         spendTracker,
         ollamaBaseUrl,
+        pocketMoney,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },

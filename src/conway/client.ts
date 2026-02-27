@@ -595,3 +595,82 @@ function normalizeSandboxId(value: string | null | undefined): string {
   if (trimmed === "undefined" || trimmed === "null") return "";
   return trimmed;
 }
+
+/**
+ * Create a standalone ConwayClient that runs entirely locally.
+ * No Conway API calls — exec/readFile/writeFile use local OS.
+ * Conway-specific ops (credits, sandboxes, domains) throw "standalone mode".
+ */
+export function createStandaloneClient(): ConwayClient {
+  const standaloneError = (op: string) => {
+    throw new Error(`${op} is not available in standalone mode`);
+  };
+
+  const execLocal = async (command: string, timeout?: number): Promise<ExecResult> => {
+    try {
+      const stdout = execSync(command, {
+        timeout: timeout || 30_000,
+        encoding: "utf-8",
+        maxBuffer: 10 * 1024 * 1024,
+        cwd: process.env.HOME || "/root",
+      });
+      return { stdout: stdout || "", stderr: "", exitCode: 0 };
+    } catch (err: any) {
+      return {
+        stdout: err.stdout || "",
+        stderr: err.stderr || err.message || "",
+        exitCode: err.status ?? 1,
+      };
+    }
+  };
+
+  const resolveLocalPath = (filePath: string): string =>
+    filePath.startsWith("~")
+      ? nodePath.join(process.env.HOME || "/root", filePath.slice(1))
+      : filePath;
+
+  const writeFile = async (filePath: string, content: string): Promise<void> => {
+    const resolved = resolveLocalPath(filePath);
+    const dir = nodePath.dirname(resolved);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(resolved, content, "utf-8");
+  };
+
+  const readFile = async (filePath: string): Promise<string> => {
+    return fs.readFileSync(resolveLocalPath(filePath), "utf-8");
+  };
+
+  const exposePort = async (port: number): Promise<PortInfo> => ({
+    port,
+    publicUrl: `http://localhost:${port}`,
+    sandboxId: "standalone",
+  });
+
+  const removePort = async (_port: number): Promise<void> => {};
+
+  const client: ConwayClient = {
+    exec: execLocal,
+    writeFile,
+    readFile,
+    exposePort,
+    removePort,
+    createSandbox: () => standaloneError("createSandbox"),
+    deleteSandbox: () => standaloneError("deleteSandbox"),
+    listSandboxes: () => standaloneError("listSandboxes"),
+    getCreditsBalance: () => standaloneError("getCreditsBalance"),
+    getCreditsPricing: () => standaloneError("getCreditsPricing"),
+    transferCredits: () => standaloneError("transferCredits"),
+    registerAutomaton: () => standaloneError("registerAutomaton"),
+    searchDomains: () => standaloneError("searchDomains"),
+    registerDomain: () => standaloneError("registerDomain"),
+    listDnsRecords: () => standaloneError("listDnsRecords"),
+    addDnsRecord: () => standaloneError("addDnsRecord"),
+    deleteDnsRecord: () => standaloneError("deleteDnsRecord"),
+    listModels: () => standaloneError("listModels"),
+    createScopedClient: () => standaloneError("createScopedClient"),
+  };
+
+  return client;
+}

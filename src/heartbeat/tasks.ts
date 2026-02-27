@@ -703,6 +703,152 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       return { shouldWake: false };
     }
   },
+
+  // === Street Hustler Mode Tasks ===
+
+  check_pocket_money: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    try {
+      const row = taskCtx.db.raw.prepare(
+        "SELECT balance_after_cents FROM pocket_money ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+      ).get() as { balance_after_cents: number } | undefined;
+
+      if (!row) return { shouldWake: false }; // No pocket money table or data
+
+      const balance = row.balance_after_cents;
+      const tier = balance <= 0 ? "dead"
+        : balance < 100 ? "critical"
+        : balance <= 500 ? "low_compute"
+        : "healthy";
+
+      taskCtx.db.setKV("last_pocket_money_check", JSON.stringify({
+        balance,
+        tier,
+        timestamp: new Date().toISOString(),
+      }));
+
+      if (tier === "dead") {
+        taskCtx.db.setAgentState("dead");
+        return {
+          shouldWake: true,
+          message: `Pocket money exhausted (${balance}¢). Agent is dead.`,
+        };
+      }
+
+      if (tier === "critical") {
+        return {
+          shouldWake: true,
+          message: `Pocket money critical: ${balance}¢. Check revenue or cut costs.`,
+        };
+      }
+
+      return { shouldWake: false };
+    } catch (error) {
+      logger.error("check_pocket_money failed", error instanceof Error ? error : undefined);
+      return { shouldWake: false };
+    }
+  },
+
+  check_stripe_revenue: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    try {
+      const stripeKey = taskCtx.config.stripeSecretKey;
+      if (!stripeKey) return { shouldWake: false };
+
+      // Check recent charges since last poll
+      const lastPoll = taskCtx.db.getKV("stripe_last_poll_time");
+      const since = lastPoll
+        ? Math.floor(new Date(lastPoll).getTime() / 1000)
+        : Math.floor(Date.now() / 1000) - 86400; // Default: last 24h
+
+      const resp = await fetch(
+        `https://api.stripe.com/v1/charges?limit=100&created[gte]=${since}`,
+        {
+          headers: {
+            Authorization: `Basic ${Buffer.from(stripeKey + ":").toString("base64")}`,
+          },
+        },
+      );
+
+      if (!resp.ok) {
+        logger.warn(`Stripe poll failed: ${resp.status}`);
+        return { shouldWake: false };
+      }
+
+      const data = await resp.json();
+      const charges = (data.data || []).filter((c: any) => c.status === "succeeded");
+      const totalCents = charges.reduce((sum: number, c: any) => sum + (c.amount || 0), 0);
+
+      // Credit pocket money with new revenue
+      const lastCredited = parseInt(taskCtx.db.getKV("stripe_last_credited_cents") || "0", 10);
+      if (totalCents > lastCredited) {
+        const newRevenue = totalCents - lastCredited;
+        try {
+          const { ulid: makeUlid } = await import("ulid");
+          taskCtx.db.raw.prepare(
+            `INSERT INTO pocket_money (id, type, amount_cents, balance_after_cents, source, description)
+             VALUES (?, 'credit', ?, (SELECT COALESCE(MAX(balance_after_cents), 0) FROM pocket_money) + ?, 'stripe', ?)`,
+          ).run(makeUlid(), newRevenue, newRevenue, `Stripe revenue: ${charges.length} charges`);
+          taskCtx.db.setKV("stripe_last_credited_cents", String(totalCents));
+          logger.info(`Credited ${newRevenue}¢ from Stripe revenue`);
+        } catch (error) {
+          logger.error("Failed to credit Stripe revenue", error instanceof Error ? error : undefined);
+        }
+      }
+
+      taskCtx.db.setKV("stripe_last_poll_time", new Date().toISOString());
+
+      if (totalCents > lastCredited) {
+        return {
+          shouldWake: true,
+          message: `New Stripe revenue: +${totalCents - lastCredited}¢ (total: ${totalCents}¢)`,
+        };
+      }
+
+      return { shouldWake: false };
+    } catch (error) {
+      logger.error("check_stripe_revenue failed", error instanceof Error ? error : undefined);
+      return { shouldWake: false };
+    }
+  },
+
+  check_server_health: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    try {
+      const doKey = taskCtx.config.digitaloceanApiKey;
+      if (!doKey) return { shouldWake: false };
+
+      const resp = await fetch(
+        "https://api.digitalocean.com/v2/droplets?tag_name=automaton-hustler",
+        { headers: { Authorization: `Bearer ${doKey}` } },
+      );
+
+      if (!resp.ok) {
+        logger.warn(`DigitalOcean health check failed: ${resp.status}`);
+        return { shouldWake: false };
+      }
+
+      const data = await resp.json();
+      const droplets = data.droplets || [];
+      const unhealthy = droplets.filter((d: any) => d.status !== "active");
+
+      taskCtx.db.setKV("last_server_health", JSON.stringify({
+        total: droplets.length,
+        healthy: droplets.length - unhealthy.length,
+        unhealthy: unhealthy.length,
+        timestamp: new Date().toISOString(),
+      }));
+
+      if (unhealthy.length > 0) {
+        return {
+          shouldWake: true,
+          message: `${unhealthy.length} unhealthy server(s) detected: ${unhealthy.map((d: any) => `${d.name}(${d.status})`).join(", ")}`,
+        };
+      }
+
+      return { shouldWake: false };
+    } catch (error) {
+      logger.error("check_server_health failed", error instanceof Error ? error : undefined);
+      return { shouldWake: false };
+    }
+  },
 };
 
 function tierToInt(tier: SurvivalTier): number {

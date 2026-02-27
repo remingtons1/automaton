@@ -46,6 +46,7 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11_ALTER_GOALS_BUDGET,
+  MIGRATION_V12,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -623,6 +624,10 @@ function applyMigrations(db: DatabaseType): void {
       apply: () => {
         try { db.exec(MIGRATION_V11_ALTER_GOALS_BUDGET); } catch { logger.debug("V11 ALTER (budget_cents) skipped — column likely exists"); }
       },
+    },
+    {
+      version: 12,
+      apply: () => db.exec(MIGRATION_V12),
     },
   ];
 

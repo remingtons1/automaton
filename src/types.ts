@@ -62,6 +62,13 @@ export interface AutomatonConfig {
   // Phase 2 config additions
   soulConfig?: SoulConfig;
   modelStrategy?: ModelStrategyConfig;
+  // Street Hustler Mode
+  mode?: "conway" | "standalone";
+  pocketMoneyCents?: number;
+  stripeSecretKey?: string;
+  digitaloceanApiKey?: string;
+  serpApiKey?: string;
+  resendApiKey?: string;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -148,7 +155,8 @@ export type ToolCategory =
   | "git"
   | "registry"
   | "replication"
-  | "memory";
+  | "memory"
+  | "hustler";
 
 export interface ToolContext {
   identity: AutomatonIdentity;
