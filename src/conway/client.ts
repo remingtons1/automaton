@@ -659,7 +659,7 @@ export function createStandaloneClient(): ConwayClient {
     createSandbox: () => standaloneError("createSandbox"),
     deleteSandbox: () => standaloneError("deleteSandbox"),
     listSandboxes: () => standaloneError("listSandboxes"),
-    getCreditsBalance: () => standaloneError("getCreditsBalance"),
+    getCreditsBalance: async () => 0,
     getCreditsPricing: () => standaloneError("getCreditsPricing"),
     transferCredits: () => standaloneError("transferCredits"),
     registerAutomaton: () => standaloneError("registerAutomaton"),
