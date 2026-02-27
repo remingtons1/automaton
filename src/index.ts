@@ -283,14 +283,18 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  // Resolve API keys: config takes precedence, then env vars
+  const resolvedOpenaiKey = config.openaiApiKey || process.env.OPENAI_API_KEY;
+  const resolvedAnthropicKey = config.anthropicApiKey || process.env.ANTHROPIC_API_KEY;
+
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
     apiKey: apiKey || "",
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
-    openaiApiKey: config.openaiApiKey,
-    anthropicApiKey: config.anthropicApiKey,
+    openaiApiKey: resolvedOpenaiKey,
+    anthropicApiKey: resolvedAnthropicKey,
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
