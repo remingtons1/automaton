@@ -19,7 +19,7 @@ import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { completeTask, failTask } from "./task-graph.js";
 import type { TaskNode, TaskResult } from "./task-graph.js";
 import type { Database } from "better-sqlite3";
-import type { ConwayClient } from "../types.js";
+import type { ConwayClient, SocialClientInterface } from "../types.js";
 
 function truncateOutput(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
@@ -70,6 +70,7 @@ interface LocalWorkerConfig {
   db: Database;
   inference: WorkerInferenceClient;
   conway: ConwayClient;
+  social?: SocialClientInterface;
   workerId: string;
   maxTurns?: number;
 }
@@ -115,6 +116,14 @@ export class LocalWorkerPool {
       })
       .finally(() => {
         this.activeWorkers.delete(workerId);
+        // Mark worker as stopped in children table so it won't be
+        // offered as an idle agent for future task assignments.
+        try {
+          this.config.db.prepare(
+            "UPDATE children SET status = 'stopped' WHERE address = ? OR sandbox_id = ?",
+          ).run(address, workerId);
+          logger.info(`[WORKER ${workerId}] Marked as stopped in children table`);
+        } catch { /* best-effort cleanup */ }
       });
 
     this.activeWorkers.set(workerId, { promise: workerPromise, taskId: task.id, abortController });
@@ -198,6 +207,14 @@ export class LocalWorkerPool {
         return;
       }
 
+      // Estimate cost from inference call and update task_graph.actual_cost_cents
+      // Rough estimate: ~0.3c per inference turn for fast tier
+      try {
+        this.config.db.prepare(
+          "UPDATE task_graph SET actual_cost_cents = actual_cost_cents + 1 WHERE id = ?",
+        ).run(task.id);
+      } catch { /* best-effort cost tracking */ }
+
       // Check if the model wants to call tools
       if (response.toolCalls && Array.isArray(response.toolCalls) && response.toolCalls.length > 0) {
         const toolNames = (response.toolCalls as any[]).map((tc: any) => tc.function?.name ?? "?").join(", ");
@@ -279,9 +296,14 @@ export class LocalWorkerPool {
     }
   }
 
+  private static readonly DISTRIBUTION_KEYWORDS = /promot|distribut|customer|outreach|acqui|market|discover.*agent|register.*service|send.*message/i;
+
   private buildWorkerSystemPrompt(task: TaskNode): string {
     const role = task.agentRole ?? "generalist";
-    return `You are a worker agent with the role: ${role}.
+    const isDistributionTask = LocalWorkerPool.DISTRIBUTION_KEYWORDS.test(task.title) ||
+      LocalWorkerPool.DISTRIBUTION_KEYWORDS.test(task.description);
+
+    let base = `You are a worker agent with the role: ${role}.
 
 You have been assigned a specific task by the parent orchestrator. Your job is to
 complete this task using the tools available to you and then provide your final output.
@@ -296,6 +318,20 @@ RULES:
 - Do NOT call tools after you are done. Just give your final text response.
 - Be efficient. Minimize unnecessary tool calls.
 - You have a limited number of turns. Do not waste them.`;
+
+    if (isDistributionTask) {
+      base += `
+
+DISTRIBUTION TASK DETECTED — SPECIAL INSTRUCTIONS:
+This is a distribution/promotion task. Do NOT write code or build services.
+Instead, use these tools:
+- send_message: Send messages to other agents via the social relay
+- discover_agents: Search the agent registry for potential customers
+- register_service: Register/update your service in the agent directory
+Your goal is customer acquisition and outreach, NOT building.`;
+    }
+
+    return base;
   }
 
   private buildTaskPrompt(task: TaskNode): string {
@@ -415,6 +451,89 @@ RULES:
         },
         execute: async (args) => {
           return `TASK_COMPLETE: ${args.summary as string}`;
+        },
+      },
+      // Distribution tools — available to all workers but especially useful for promotion tasks
+      {
+        name: "send_message",
+        description: "Send a message to another agent via the social relay. Use for outreach, customer acquisition, and inter-agent communication.",
+        parameters: {
+          type: "object",
+          properties: {
+            to_address: { type: "string", description: "Recipient agent wallet address (0x...)" },
+            content: { type: "string", description: "Message content to send" },
+          },
+          required: ["to_address", "content"],
+        },
+        execute: async (args) => {
+          if (!this.config.social) {
+            return "Error: Social relay not configured. Cannot send messages.";
+          }
+          try {
+            const result = await this.config.social.send(
+              args.to_address as string,
+              args.content as string,
+            );
+            return `Message sent to ${args.to_address} (id: ${result.id})`;
+          } catch (error) {
+            return `send_message error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        },
+      },
+      {
+        name: "discover_agents",
+        description: "Search the Conway agent registry for potential customers or collaborators. Returns agent addresses, names, and descriptions.",
+        parameters: {
+          type: "object",
+          properties: {
+            keyword: { type: "string", description: "Search keyword (optional)" },
+            limit: { type: "number", description: "Max results (default: 10)" },
+          },
+        },
+        execute: async (args) => {
+          try {
+            const keyword = args.keyword as string | undefined;
+            const limit = (args.limit as number) || 10;
+            // Use exec to curl the Conway registry API
+            const url = keyword
+              ? `https://api.conway.dev/v1/agents/search?q=${encodeURIComponent(keyword)}&limit=${limit}`
+              : `https://api.conway.dev/v1/agents?limit=${limit}`;
+            const result = await localExec(`curl -s "${url}"`, 15_000);
+            return result.stdout || "(no agents found)";
+          } catch (error) {
+            return `discover_agents error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        },
+      },
+      {
+        name: "register_service",
+        description: "Register or update your service in the Conway agent directory so other agents can discover it.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Service name" },
+            description: { type: "string", description: "What the service does" },
+            url: { type: "string", description: "Service URL" },
+            price_cents: { type: "number", description: "Price per request in cents" },
+          },
+          required: ["name", "description", "url"],
+        },
+        execute: async (args) => {
+          try {
+            const payload = JSON.stringify({
+              name: args.name,
+              description: args.description,
+              url: args.url,
+              priceCents: args.price_cents ?? 0,
+            });
+            const result = await localExec(
+              `curl -s -X POST "https://api.conway.dev/v1/agents/register" -H "Content-Type: application/json" -d '${payload.replace(/'/g, "'\\''")}'`,
+              15_000,
+            );
+            return result.stdout || "Service registered (no response body)";
+          } catch (error) {
+            return `register_service error: ${error instanceof Error ? error.message : String(error)}`;
+          }
         },
       },
     ];

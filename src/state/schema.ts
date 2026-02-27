@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -670,4 +670,9 @@ export const MIGRATION_V10 = `
 
   CREATE INDEX idx_knowledge_category ON knowledge_store(category);
   CREATE INDEX idx_knowledge_key ON knowledge_store(key);
+`;
+
+// === V11: Per-goal budget enforcement ===
+export const MIGRATION_V11_ALTER_GOALS_BUDGET = `
+  ALTER TABLE goals ADD COLUMN budget_cents INTEGER DEFAULT 100;
 `;

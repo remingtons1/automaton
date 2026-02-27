@@ -151,9 +151,10 @@ export async function runAgentLoop(
       if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
         process.env.CONWAY_API_KEY = config.conwayApiKey;
       }
-      // If no OpenAI key is set but Conway key is available, use Conway as
-      // the OpenAI provider (Conway Compute is OpenAI API-compatible).
-      if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
+      // If no BYOK OpenAI key is in the automaton config but Conway key is
+      // available, use Conway as the OpenAI provider. This overrides any
+      // stale/invalid OPENAI_API_KEY that might exist in the shell env.
+      if (!config.openaiApiKey && config.conwayApiKey) {
         process.env.OPENAI_API_KEY = config.conwayApiKey;
         process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
       }
@@ -214,6 +215,7 @@ export async function runAgentLoop(
         db: db.raw,
         inference: workerInference,
         conway,
+        social,
         workerId: `pool-${identity.name}`,
       });
 

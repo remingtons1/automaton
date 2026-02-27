@@ -45,6 +45,7 @@ import {
   MIGRATION_V9,
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
+  MIGRATION_V11_ALTER_GOALS_BUDGET,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -617,6 +618,12 @@ function applyMigrations(db: DatabaseType): void {
       version: 10,
       apply: () => db.exec(MIGRATION_V10),
     },
+    {
+      version: 11,
+      apply: () => {
+        try { db.exec(MIGRATION_V11_ALTER_GOALS_BUDGET); } catch { logger.debug("V11 ALTER (budget_cents) skipped — column likely exists"); }
+      },
+    },
   ];
 
   for (const m of migrations) {
@@ -685,6 +692,7 @@ export interface GoalRow {
   strategy: string | null;
   expectedRevenueCents: number;
   actualRevenueCents: number;
+  budgetCents: number;
   createdAt: string;
   deadline: string | null;
   completedAt: string | null;
@@ -2245,6 +2253,7 @@ function deserializeGoalRow(row: any): GoalRow {
     strategy: row.strategy ?? null,
     expectedRevenueCents: row.expected_revenue_cents,
     actualRevenueCents: row.actual_revenue_cents,
+    budgetCents: row.budget_cents ?? 100,
     createdAt: row.created_at,
     deadline: row.deadline ?? null,
     completedAt: row.completed_at ?? null,

@@ -48,6 +48,76 @@ const ORCHESTRATOR_TODO_KEY = "orchestrator.todo_md";
 const DEFAULT_TASK_FUNDING_CENTS = 25;
 const DEFAULT_MAX_REPLANS = 3;
 
+const REVENUE_KEYWORDS = /revenue|paid|payment|monetize|x402|sell|earn|income|profit/i;
+
+/** Build fallback task list for when the planner returns nothing usable.
+ *  For revenue goals, uses 3-task decomposition: DISCOVER → BUILD → DISTRIBUTE. */
+function buildFallbackTasks(
+  goal: { title: string; description: string },
+  mode: "plan" | "replan",
+): PlannedTask[] {
+  const isRevenueGoal = REVENUE_KEYWORDS.test(goal.description) || REVENUE_KEYWORDS.test(goal.title);
+
+  if (!isRevenueGoal) {
+    return [{
+      title: mode === "replan" ? `[Replan] ${goal.title}` : goal.title,
+      description: goal.description,
+      agentRole: "generalist",
+      dependencies: [],
+      estimatedCostCents: 200,
+      priority: 50,
+      timeoutMs: 300_000,
+    }];
+  }
+
+  // Revenue goal: 3-task decomposition — discovery → build → distribute
+  const prefix = mode === "replan" ? "[Replan] " : "";
+  const discoveryTask: PlannedTask = {
+    title: `${prefix}Research demand and identify first customers`,
+    description:
+      "DISCOVERY PHASE — do NOT build anything yet.\n" +
+      "1. Use discover_agents to search the Conway registry for agents that might need this service\n" +
+      "2. Identify at least 5 potential customers and what they would pay for\n" +
+      "3. Validate there is real demand before any code is written\n" +
+      "4. Document: who are the customers, what do they need, what will they pay?\n" +
+      "If no demand exists, say so clearly — do not proceed to building.",
+    agentRole: "generalist",
+    dependencies: [],
+    estimatedCostCents: 50,
+    priority: 70,
+    timeoutMs: 300_000,
+  };
+
+  const buildTask: PlannedTask = {
+    title: `${prefix}Build and deploy MVP`,
+    description: goal.description,
+    agentRole: "generalist",
+    dependencies: [0],
+    estimatedCostCents: 200,
+    priority: 50,
+    timeoutMs: 300_000,
+  };
+
+  const distTask: PlannedTask = {
+    title: `${prefix}Promote service and acquire first paying customer`,
+    description:
+      "DISTRIBUTION PHASE — the service is LIVE. Your ONLY job is customer acquisition:\n" +
+      "1. Use send_message to contact the potential customers identified in the discovery phase\n" +
+      "2. Register the service in Conway agent directories using register_service\n" +
+      "3. Use discover_agents to find more potential users and message them\n" +
+      "4. Verify the landing page clearly explains value proposition and pricing\n" +
+      "5. Track outreach attempts and conversions\n" +
+      "DO NOT build or modify the service code. Focus entirely on getting the first $1 of real revenue.",
+    agentRole: "generalist",
+    dependencies: [1],
+    estimatedCostCents: 100,
+    priority: 60,
+    timeoutMs: 300_000,
+  };
+
+  return [discoveryTask, buildTask, distTask];
+}
+
 type ExecutionPhase =
   | "idle"
   | "classifying"
@@ -406,19 +476,12 @@ export class Orchestrator {
         goalId: goal.id,
         error: err.message,
       });
+      const fallbackTasks = buildFallbackTasks(goal, "plan");
       output = {
         analysis: `Planner fallback: ${err.message}`,
-        strategy: "Execute goal as a single generalist task",
+        strategy: fallbackTasks.length > 1 ? "Build then distribute (revenue goal)" : "Execute goal as a single generalist task",
         customRoles: [],
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
+        tasks: fallbackTasks,
         risks: ["Planner unavailable — executing without decomposition"],
         estimatedTotalCostCents: 200,
         estimatedTimeMinutes: 30,
@@ -428,17 +491,10 @@ export class Orchestrator {
     if (output.tasks.length === 0) {
       // Planner returned valid JSON but empty tasks — use fallback single task
       logger.warn("Planner returned no tasks, falling back to single-task plan", { goalId: goal.id });
+      const emptyFallbackTasks = buildFallbackTasks(goal, "plan");
       output = {
         ...output,
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
+        tasks: emptyFallbackTasks,
       };
     }
 
@@ -531,6 +587,11 @@ export class Orchestrator {
           this.params.db.prepare(
             "UPDATE task_graph SET status = 'pending', assigned_to = NULL, started_at = NULL WHERE id = ?",
           ).run(task.id);
+          // Also mark the dead worker as stopped so it won't be
+          // selected again by the agent tracker for new assignments.
+          this.params.db.prepare(
+            "UPDATE children SET status = 'stopped' WHERE address = ? AND status IN ('running', 'healthy')",
+          ).run(task.assignedTo);
         }
       }
     }
@@ -635,7 +696,96 @@ export class Orchestrator {
 
     const progress = getGoalProgress(this.params.db, goal.id);
 
+    // Budget enforcement: fail goal if spend exceeds budget_cents
+    const goalBudget = goal.budgetCents ?? 0;
+    if (goalBudget > 0) {
+      const spendRow = this.params.db.prepare(
+        `SELECT COALESCE(SUM(actual_cost_cents), 0) AS spent FROM task_graph WHERE goal_id = ?`,
+      ).get(goal.id) as { spent: number } | undefined;
+      const spent = spendRow?.spent ?? 0;
+      if (spent >= goalBudget) {
+        logger.warn("Goal budget exceeded, failing goal", {
+          goalId: goal.id,
+          budgetCents: goalBudget,
+          spentCents: spent,
+        });
+        updateGoalStatus(this.params.db, goal.id, "failed");
+        // Cancel remaining tasks
+        this.params.db.prepare(
+          `UPDATE task_graph SET status = 'cancelled' WHERE goal_id = ? AND status IN ('pending', 'assigned', 'running', 'blocked')`,
+        ).run(goal.id);
+        return {
+          ...state,
+          phase: "failed",
+          failedError: `Budget exceeded: spent ${spent}c of ${goalBudget}c budget`,
+        };
+      }
+    }
+
+    // Dead-end detection: all tasks in terminal states but not all completed
+    if (progress.total > 0) {
+      const actionable = progress.total - progress.completed - progress.failed - progress.cancelled;
+      if (actionable === 0 && progress.completed < progress.total) {
+        logger.warn("Goal is in a dead-end state — all tasks terminal but not all completed", {
+          goalId: goal.id,
+          total: progress.total,
+          completed: progress.completed,
+          failed: progress.failed,
+          cancelled: progress.cancelled,
+        });
+        const maxReplans = this.getMaxReplans();
+        if (state.replanCount < maxReplans) {
+          return {
+            ...state,
+            phase: "replanning",
+            replanCount: state.replanCount,
+            failedTaskId: this.findFirstFailedTaskId(goal.id),
+            failedError: `Dead-end: ${progress.failed} failed, ${progress.cancelled} cancelled, ${progress.completed}/${progress.total} completed`,
+          };
+        }
+        updateGoalStatus(this.params.db, goal.id, "failed");
+        return {
+          ...state,
+          phase: "failed",
+          failedError: `Dead-end: all tasks terminal but only ${progress.completed}/${progress.total} completed. Max replans exhausted.`,
+        };
+      }
+    }
+
     if (progress.total > 0 && progress.completed === progress.total) {
+      // Revenue gate: if the goal description mentions revenue, payment,
+      // or monetization keywords, require actual_revenue > 0 before
+      // marking it complete. Otherwise it's just "code shipped, nobody paying."
+      const isRevenueGoal = REVENUE_KEYWORDS.test(goal.description) || REVENUE_KEYWORDS.test(goal.title);
+      const freshGoal = getGoalById(this.params.db, goal.id);
+      const actualRevenue = freshGoal?.actualRevenueCents ?? 0;
+
+      if (isRevenueGoal && actualRevenue === 0) {
+        // All tasks are "done" but no revenue recorded. Don't mark complete.
+        // Instead, trigger a replan to add promotion/distribution tasks.
+        logger.warn("Revenue goal has $0 actual revenue despite all tasks complete — forcing replan for distribution", {
+          goalId: goal.id,
+          title: goal.title,
+        });
+        const maxReplans = this.getMaxReplans();
+        if (state.replanCount < maxReplans) {
+          return {
+            ...state,
+            phase: "replanning",
+            replanCount: state.replanCount + 1,
+            failedTaskId: null,
+            failedError: "All technical tasks completed but $0 revenue generated. The goal needs promotion, distribution, and customer acquisition tasks — not more building. Add tasks to: (1) register the service in agent directories and discovery protocols, (2) message potential customers/agents, (3) create a compelling landing page, (4) verify at least one real paid transaction is received.",
+          };
+        }
+        // Max replans exhausted — fail the goal rather than falsely completing it
+        updateGoalStatus(this.params.db, goal.id, "failed");
+        return {
+          ...state,
+          phase: "failed",
+          failedError: "Revenue goal completed all technical tasks but generated $0 revenue. Max replans exhausted.",
+        };
+      }
+
       updateGoalStatus(this.params.db, goal.id, "completed");
       return {
         ...state,
@@ -698,19 +848,12 @@ export class Orchestrator {
         goalId: goal.id,
         error: err.message,
       });
+      const replanFallbackTasks = buildFallbackTasks(goal, "replan");
       output = {
         analysis: `Replanner fallback: ${err.message}`,
-        strategy: "Re-execute goal as a single generalist task",
+        strategy: replanFallbackTasks.length > 1 ? "Rebuild then distribute (revenue goal)" : "Re-execute goal as a single generalist task",
         customRoles: [],
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
+        tasks: replanFallbackTasks,
         risks: ["Replanner unavailable — re-executing without decomposition"],
         estimatedTotalCostCents: 200,
         estimatedTimeMinutes: 30,
@@ -719,17 +862,10 @@ export class Orchestrator {
 
     if (output.tasks.length === 0) {
       logger.warn("Replanner returned no tasks, falling back to single-task plan", { goalId: goal.id });
+      const replanEmptyFallback = buildFallbackTasks(goal, "replan");
       output = {
         ...output,
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
+        tasks: replanEmptyFallback,
       };
     }
 

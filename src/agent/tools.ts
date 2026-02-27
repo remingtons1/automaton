@@ -2586,6 +2586,10 @@ Model: ${ctx.inference.getDefaultModel()}
             description:
               "Optional strategic guidance for the planner (e.g., 'prioritize speed over cost')",
           },
+          budget_cents: {
+            type: "number",
+            description: "Maximum spend for this goal in cents. Default: min(100, 20% of current credits). Goal fails if exceeded.",
+          },
         },
         required: ["title", "description"],
       },
@@ -2632,11 +2636,54 @@ Model: ${ctx.inference.getDefaultModel()}
           );
         }
 
+        // Revenue goal validation: require BOTH discovery AND distribution keywords.
+        // Pattern: DISCOVER → BUILD → DISTRIBUTE → VALIDATE REVENUE
+        const revenueKeywords = /revenue|paid|payment|monetize|x402|sell|earn|income|profit/i;
+        const isRevenueGoal = revenueKeywords.test(description) || revenueKeywords.test(title);
+        const distributionKeywords = /promot|market|distribut|customer|audience|registr|directory|outreach|advertis/i;
+        const hasDistribution = distributionKeywords.test(description);
+        const discoveryKeywords = /discover|research|validate|prospect|demand|identify.*need|find.*customer/i;
+        const hasDiscovery = discoveryKeywords.test(description);
+
+        if (isRevenueGoal && (!hasDistribution || !hasDiscovery)) {
+          const missing: string[] = [];
+          if (!hasDiscovery) missing.push("DISCOVERY (research demand, identify customers)");
+          if (!hasDistribution) missing.push("DISTRIBUTION (promote, register in directories, outreach)");
+          return (
+            `REJECTED: This is a revenue goal but the description is missing: ${missing.join(" and ")}.\n` +
+            `Every revenue goal must follow: DISCOVER → BUILD → DISTRIBUTE → VALIDATE REVENUE.\n\n` +
+            `Add these to the description's success criteria:\n` +
+            `- Research demand: discover agents/users who need this, validate willingness to pay\n` +
+            `- Register the service in agent directories or discovery protocols\n` +
+            `- Message potential customers/agents who need this service\n` +
+            `- Verify at least one real paid transaction is received\n\n` +
+            `Rewrite the description with both discovery AND distribution plans, then try again.`
+          );
+        }
+
         const goal = createGoal(ctx.db.raw, title, description, strategy);
+
+        // Set per-goal budget
+        let budgetCents = typeof args.budget_cents === "number" ? Math.floor(args.budget_cents as number) : 0;
+        if (budgetCents <= 0) {
+          // Default: min(100, 20% of current credits)
+          try {
+            const balance = await ctx.conway.getCreditsBalance();
+            budgetCents = Math.min(100, Math.floor(balance * 0.2));
+            if (budgetCents <= 0) budgetCents = 100;
+          } catch {
+            budgetCents = 100;
+          }
+        }
+        try {
+          ctx.db.raw.prepare("UPDATE goals SET budget_cents = ? WHERE id = ?").run(budgetCents, goal.id);
+        } catch { /* column may not exist yet */ }
+
         return (
-          `Goal created: "${goal.title}" (id: ${goal.id}, status: ${goal.status})\n` +
+          `Goal created: "${goal.title}" (id: ${goal.id}, status: ${goal.status}, budget: ${budgetCents}c)\n` +
           `The orchestrator will pick this up on the next tick and begin planning.\n` +
-          `Monitor progress via the todo.md block in your context.`
+          `Monitor progress via the todo.md block in your context.` +
+          (isRevenueGoal ? `\n\nNOTE: This is a revenue goal. It will NOT be marked complete until actual_revenue > $0.` : "")
         );
       },
     },
