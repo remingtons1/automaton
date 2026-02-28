@@ -76,8 +76,8 @@ function buildFallbackTasks(
     title: `${prefix}Research demand and identify first customers`,
     description:
       "DISCOVERY PHASE — do NOT build anything yet.\n" +
-      "1. Use discover_agents to search the Conway registry for agents that might need this service\n" +
-      "2. Identify at least 5 potential customers and what they would pay for\n" +
+      "1. Use web_fetch and search_web to research real demand for this service on the internet\n" +
+      "2. Identify at least 5 potential customer segments and what they would pay for\n" +
       "3. Validate there is real demand before any code is written\n" +
       "4. Document: who are the customers, what do they need, what will they pay?\n" +
       "If no demand exists, say so clearly — do not proceed to building.",
@@ -180,6 +180,21 @@ export class Orchestrator {
     };
 
     let state = this.loadState();
+
+    // If the current goal was cancelled or failed externally, reset to idle
+    // so the orchestrator can pick up new goals.
+    if (state.goalId && state.phase !== "idle" && state.phase !== "failed" && state.phase !== "complete") {
+      const goal = getGoalById(this.params.db, state.goalId);
+      if (!goal || goal.status !== "active") {
+        logger.info("Current goal is no longer active, resetting to idle", {
+          goalId: state.goalId,
+          goalStatus: goal?.status ?? "not found",
+          phase: state.phase,
+        });
+        state = { ...state, phase: "idle", goalId: null, replanCount: 0, failedTaskId: null, failedError: null };
+        this.saveState(state);
+      }
+    }
 
     try {
       switch (state.phase) {

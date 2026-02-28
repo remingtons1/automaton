@@ -134,11 +134,9 @@ export class UnifiedInferenceClient {
         failedProviders.push(resolved.provider.id);
         this.markProviderFailure(resolved.provider.id);
 
-        if (error.retryable) {
-          continue;
-        }
-
-        throw this.unwrapError(error.originalError);
+        // Always try the next provider in the cascade — even non-retryable
+        // errors (like 402) may be provider-specific and succeed elsewhere.
+        continue;
       }
     }
 
